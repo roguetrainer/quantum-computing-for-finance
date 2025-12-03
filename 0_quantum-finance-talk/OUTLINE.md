@@ -1,7 +1,7 @@
 # QUANTUM COMPUTING FOR FINANCE: FROM THEORY TO APPLICATION
 ## Workshop Outline - Technical/Workshop Format
 
-**Speaker:** Ian Grooms  
+**Speaker:** Ian Buckley  
 **Duration:** 75-90 minutes (60 min presentation + 15-30 min interactive Q&A/demos)  
 **Audience:** Technical/quantitative professionals (quants, data scientists, researchers)  
 **Format:** Workshop with hands-on elements and code examples  
