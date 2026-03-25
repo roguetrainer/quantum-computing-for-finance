@@ -237,7 +237,7 @@ def train_vqc(circuit, X_train, y_train, X_test, y_test,
     
     # Initialize parameters
     np.random.seed(random_state)
-    params = np.random.uniform(0, 2*np.pi, (n_layers, n_qubits, 2), requires_grad=True)
+    params = pnp.random.uniform(0, 2*np.pi, (n_layers, n_qubits, 2), requires_grad=True)
     
     # Optimizer
     optimizer = AdamOptimizer(learning_rate)
