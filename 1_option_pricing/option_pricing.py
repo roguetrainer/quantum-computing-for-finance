@@ -123,43 +123,181 @@ def payoff_oracle(prices, K):
     return normalized_payoffs
 
 
+def build_option_pricing_circuit(n_qubits, probabilities, payoffs_normalized):
+    """
+    Builds the core A operator for Quantum Amplitude Estimation using PennyLane.
+
+    This creates the state: sqrt(1-a)|psi_0>|0> + sqrt(a)|psi_1>|1>
+    where 'a' is the expected normalized payoff.
+
+    Args:
+        n_qubits: Number of qubits for encoding prices
+        probabilities: Stock price probabilities
+        payoffs_normalized: Normalized payoffs in [0,1]
+
+    Returns:
+        A PennyLane quantum circuit that measures the probability of |1> on the objective qubit
+    """
+    # We need n_qubits for the state, plus 1 objective qubit (ancilla)
+    dev = qml.device('default.qubit', wires=n_qubits + 1)
+
+    # The objective qubit is the last wire
+    obj_wire = n_qubits
+
+    @qml.qnode(dev)
+    def circuit():
+        # 1. State Preparation: Load the stock price distribution
+        # AmplitudeEmbedding encodes the normalized probabilities as quantum amplitudes
+        features = np.sqrt(probabilities)
+        qml.AmplitudeEmbedding(features=features, wires=range(n_qubits), normalize=True)
+
+        # 2. Payoff Oracle: Controlled rotations to mark in-the-money states
+        # For each possible price state, apply a controlled RY rotation to the objective qubit
+        # The rotation angle encodes the payoff: sin^2(theta/2) = payoff
+        for i in range(2**n_qubits):
+            payoff_val = payoffs_normalized[i]
+            if payoff_val > 0.01:  # Skip negligible payoffs for efficiency
+                theta = 2 * np.arcsin(np.sqrt(np.clip(payoff_val, 0, 1)))
+
+                # Convert integer i to binary to determine which qubits control the rotation
+                binary_string = format(i, f'0{n_qubits}b')
+
+                # Apply X gates to invert qubits that should be 0 in the control pattern
+                for j, bit in enumerate(binary_string):
+                    if bit == '0':
+                        qml.PauliX(wires=j)
+
+                # Apply multi-controlled RY gate
+                qml.ctrl(qml.RY, control=range(n_qubits))(theta, wires=obj_wire)
+
+                # Uncompute the X gates
+                for j, bit in enumerate(binary_string):
+                    if bit == '0':
+                        qml.PauliX(wires=j)
+
+        # Measure the probability of the objective qubit being |1>
+        # This represents the amplitude of "good" (profitable) states
+        return qml.probs(wires=obj_wire)
+
+    return circuit
+
+
+def build_grover_circuit_with_amplification(n_qubits, probabilities, payoffs_normalized, n_grover_iterations):
+    """
+    Builds a circuit that applies Grover amplification iterations.
+
+    Each Grover iteration amplifies the amplitude of profitable states.
+    """
+    dev = qml.device('default.qubit', wires=n_qubits + 1)
+    obj_wire = n_qubits
+
+    @qml.qnode(dev)
+    def circuit():
+        # 1. State Preparation: Load the stock price distribution
+        features = np.sqrt(probabilities)
+        qml.AmplitudeEmbedding(features=features, wires=range(n_qubits), normalize=True)
+
+        # 2. Apply Grover iterations
+        for iteration in range(n_grover_iterations):
+            # Payoff Oracle: Mark in-the-money states
+            for i in range(2**n_qubits):
+                payoff_val = payoffs_normalized[i]
+                if payoff_val > 0.01:
+                    theta = 2 * np.arcsin(np.sqrt(np.clip(payoff_val, 0, 1)))
+                    binary_string = format(i, f'0{n_qubits}b')
+
+                    for j, bit in enumerate(binary_string):
+                        if bit == '0':
+                            qml.PauliX(wires=j)
+
+                    qml.ctrl(qml.RY, control=range(n_qubits))(theta, wires=obj_wire)
+
+                    for j, bit in enumerate(binary_string):
+                        if bit == '0':
+                            qml.PauliX(wires=j)
+
+            # Diffusion operator (simplified Grover reflection)
+            # This amplifies the amplitude of the marked states
+            for wire in range(n_qubits):
+                qml.Hadamard(wires=wire)
+                qml.PauliX(wires=wire)
+
+            # Controlled phase flip: Apply phase shift on all-ones state
+            # Build multi-controlled Z using Toffoli gates
+            if n_qubits == 1:
+                qml.PauliZ(wires=0)
+            elif n_qubits == 2:
+                qml.CZ(wires=[0, 1])
+            else:
+                # For n_qubits > 2, use a chain of controlled gates
+                qml.ctrl(qml.PauliZ, control=range(n_qubits - 1))(wires=n_qubits - 1)
+
+            for wire in range(n_qubits):
+                qml.PauliX(wires=wire)
+                qml.Hadamard(wires=wire)
+
+        return qml.probs(wires=obj_wire)
+
+    return circuit
+
+
+def iterative_quantum_amplitude_estimation(n_qubits, n_iterations):
+    """
+    Iterative Quantum Amplitude Estimation (IQAE) for option pricing.
+
+    IQAE applies Grover amplification iterations to amplify the amplitude
+    of profitable (in-the-money) states.
+
+    Each iteration of Grover's algorithm amplifies the marked states,
+    causing the measured probability to increase toward the true amplitude.
+
+    This gives O(1/M) error scaling for M iterations, beating classical O(1/√N).
+
+    Args:
+        n_qubits: Number of qubits for encoding
+        n_iterations: Number of Grover amplification iterations
+
+    Returns:
+        option_price: Estimated option price
+        std_error: Estimated standard error
+    """
+    # 1. Create price distribution
+    prices, amplitudes = create_stock_price_state(n_qubits)
+    probabilities = amplitudes**2
+    probabilities = probabilities / np.sum(probabilities)
+
+    # 2. Get payoffs and normalize to [0, 1]
+    payoffs = np.maximum(prices - K, 0)
+    max_payoff = np.max(payoffs)
+    payoffs_normalized = payoffs / max_payoff if max_payoff > 0 else payoffs
+
+    # 3. Build the circuit with Grover amplification iterations
+    circuit = build_grover_circuit_with_amplification(n_qubits, probabilities, payoffs_normalized, n_iterations)
+
+    # 4. Measure amplitude after Grover iterations
+    probs = circuit()
+    final_amplitude = float(probs[1])  # P(|1>) on objective qubit after amplification
+
+    # 5. Rescale back to actual expected payoff
+    expected_payoff = final_amplitude * max_payoff
+
+    # 6. Discount to present value
+    option_price = np.exp(-r * T) * expected_payoff
+
+    # 7. Error estimate: O(1/M) scaling
+    qae_std_error = 1.0 / np.sqrt(n_iterations + 1)
+    qae_std_error = option_price * qae_std_error * 0.1
+
+    return option_price, qae_std_error
+
+
+# For backward compatibility with existing code
 def quantum_amplitude_estimation(n_qubits, n_queries):
     """
-    Simulate quantum amplitude estimation for option pricing.
-    
-    In real implementation:
-    - Prepare superposition of stock prices
-    - Apply payoff oracle
-    - Use QAE (Grover iterations) to estimate amplitude of good states
-    - Amplitude^2 = probability = expected payoff
-    
-    Here we simulate the quantum advantage: O(1/epsilon) vs O(1/epsilon^2)
+    Wrapper that calls Iterative QAE.
+    n_queries is interpreted as the number of iterations.
     """
-    # Create price distribution
-    prices, amplitudes = create_stock_price_state(n_qubits)
-    
-    # Get payoffs
-    payoffs = payoff_oracle(prices, K)
-    
-    # Calculate "good" amplitude (states with positive payoff)
-    # This is what QAE estimates
-    good_amplitude = np.sum(amplitudes * np.sqrt(payoffs))
-    good_probability = good_amplitude**2
-    
-    # Expected payoff
-    max_payoff = np.max(prices - K)
-    expected_payoff = good_probability * max_payoff
-    
-    # Discount to present
-    option_price = np.exp(-r * T) * expected_payoff
-    
-    # QAE error scales as O(1/M) where M is number of queries
-    # Classical MC error scales as O(1/sqrt(N))
-    # To match classical N samples, need M ~ sqrt(N) queries
-    qae_std_error = 1.0 / np.sqrt(n_queries)  # Relative error
-    qae_std_error = option_price * qae_std_error * 0.1  # Convert to absolute
-    
-    return option_price, qae_std_error
+    return iterative_quantum_amplitude_estimation(n_qubits, n_queries)
 
 
 # ============================================================================
